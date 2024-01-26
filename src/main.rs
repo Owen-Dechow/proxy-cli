@@ -1,5 +1,8 @@
-use std::process::{self as proc, exit};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::select;
 
+use std::process::{self as proc};
 pub mod cli;
 pub mod db;
 pub mod debug;
@@ -7,31 +10,67 @@ pub mod debug;
 use clap::Parser as _;
 use json;
 
-fn run_command(cmd: String) {
-    let result = proc::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
+async fn run_command(cmd: String) -> Result<proc::ExitStatus, io::Error> {
+    let (prog, arg1) = match cfg!(target_os = "windows") {
+        true => ("cmd", "/C"),
+        false => ("sh", "-c"),
+    };
+
+    let mut app = Command::new(prog)
+        .args([arg1, &cmd])
+        .stdin(proc::Stdio::piped())
         .stdout(proc::Stdio::piped())
-        .output();
+        .spawn()?;
 
-    match result {
-        Ok(out) => {
-            let std_out = String::from_utf8_lossy(&out.stdout);
-            let std_err = String::from_utf8_lossy(&out.stderr);
+    let mut app_stdin = match app.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not find application stdin",
+            ))
+        }
+    };
+    let app_stdout = match app.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not find application stdout",
+            ))
+        }
+    };
 
-            if std_out.len() > 0 {
-                println!("\n{}", std_out);
+    let mut reader = BufReader::new(app_stdout);
+    let mut stdin_reader = BufReader::new(tokio::io::stdin());
+    let mut input = String::new();
+
+    loop {
+        let mut buffer = [0; 1]; // Buffer to hold one byte
+
+        select! {
+            Ok(n) = reader.read(&mut buffer) => {
+                if n == 0 {
+                    break;
+                }
+                print!("{}", buffer[0] as char);
+                io::stdout().flush().await.unwrap();  // Make sure the byte is printed immediately
             }
-
-            if std_err.len() > 0 {
-                println!("\n{}", std_err);
+            Ok(n) = stdin_reader.read_line(&mut input) => {
+                if n > 0 {
+                    app_stdin.write_all(input.as_bytes()).await?;
+                    app_stdin.flush().await?;
+                    input.clear();
+                }
             }
         }
-        Err(err) => debug::print(err.to_string()),
-    };
+    }
+
+    return app.wait().await;
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut map = match db::get_db_content() {
         Ok(map) => map,
         Err(err) => match err {
@@ -44,7 +83,7 @@ fn main() {
         Ok(args) => args,
         Err(err) => {
             debug::print(format!("{}", err));
-            exit(err.exit_code());
+            proc::exit(err.exit_code());
         }
     };
 
@@ -56,9 +95,13 @@ fn main() {
             if cmd_path.is_null() {
                 debug::print(format!("Command not found in DB: {}", &cmd));
             } else {
-                run_command(format!("{} {}", cmd_path, cmd_args));
+                match run_command(format!("{} {}", cmd_path, cmd_args)).await {
+                    Ok(_status) => {}
+                    Err(err) => debug::print(format!("Error running command: {}", err)),
+                }
             }
         }
+
         cli::Command::Add { path } => {
             let split_key = path
                 .components()

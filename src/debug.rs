@@ -13,7 +13,7 @@ results in like box:
 
 */
 
-const BOX_WIDTH: usize = 100;
+const BOX_WIDTH: usize = 75;
 const BOX_TITLE: &str = " PROXY ";
 const VERTICAL: char = '|';
 const HORIZONTAL: char = '-';
